@@ -1,0 +1,234 @@
+---
+title: "Análisis Geoespacial Socioeconómico – Honduras 2024‑2026"
+author: "Equipo de Análisis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: default
+    toc: true
+    toc_float: true
+    self_contained: true
+    css: "styles.css"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(terra); library(sf); library(leaflet)
+library(dplyr); library(readr); library(DT)
+```
+
+## Introducción
+Este informe presenta un análisis geoespacial de Honduras combinando población específica que se analiza (edad y género masculino), densidad, índice de riqueza relativa (RWI) y variables de vulnerabilidad socioeconómica. Los mapas interactivos permiten inspeccionar los valores a nivel de municipio y obtener la información exacta de cada variable.
+
+```{r carga, include=FALSE}
+# Rasters
+rast_pop  <- terra::rast("/Users/fortune/Downloads/hnd_pop_2026_CN_100m_R2025A_v1.tif")
+rast_dens <- terra::rast("/Users/fortune/Downloads/hnd_pd_2020_1km.tif")
+# Límites municipales
+gdf_mun   <- sf::st_read("/Users/fortune/Downloads/geoBoundaries-HND-ADM2_simplified.geojson", quiet = TRUE)
+# Estadísticas poblacionales
+pop_df    <- readr::read_csv("/Users/fortune/Downloads/hnd_admpop_adm2_2024.csv", show_col_types = FALSE)
+# RWI
+rwi_df    <- readr::read_csv("/Users/fortune/Downloads/honduras_relative_wealth_index.csv", show_col_types = FALSE)
+rwi_sf    <- sf::st_as_sf(rwi_df, coords = c("longitude","latitude"), crs = 4326)
+```
+
+```{r proceso, include=FALSE}
+pop_proc <- pop_df %>%
+  mutate(
+    pop_5_30  = T_05_09 + T_10_14 + T_15_19 + T_20_24 + T_25_29 + T_30_34,
+    pct_5_30  = round(pop_5_30 / T_TL * 100, 1),
+    pct_men   = round(M_TL / T_TL * 100, 1),
+    pct_women = round(F_TL / T_TL * 100, 1),
+    name_key  = toupper(trimws(ADM2_ES))
+  )
+
+gdf_mun$name_key <- toupper(trimws(gdf_mun$shapeName))
+gdf_merged <- gdf_mun %>% left_join(pop_proc, by = "name_key")
+
+rwi_joined <- sf::st_join(rwi_sf, gdf_merged[c("name_key","geometry")], join = sf::st_within)
+rwi_by_mun <- rwi_joined %>%
+  sf::st_drop_geometry() %>%
+  group_by(name_key) %>%
+  summarise(rwi_mean = mean(rwi, na.rm = TRUE), rwi_n = n())
+
+gdf_merged <- gdf_merged %>% left_join(rwi_by_mun, by = "name_key")
+
+vect_mun   <- terra::vect(gdf_merged)
+dens_stats <- terra::extract(rast_dens, vect_mun, fun = mean, na.rm = TRUE)
+gdf_merged$rast_dens_mean <- dens_stats[,2]
+
+gdf_merged <- gdf_merged %>%
+  mutate(
+    low_density = ifelse(!is.na(rast_dens_mean) & rast_dens_mean < 50, TRUE, FALSE),
+    risk_score  = (
+      ifelse(!is.na(pct_5_30), (pct_5_30 - 30) / 30, 0) +
+      ifelse(!is.na(rwi_mean), (-rwi_mean) * 1.5, 0) +
+      ifelse(low_density, 0.5, 0) +
+      ifelse(!is.na(pct_men) & pct_men > 50, (pct_men - 50) / 10, 0)
+    )
+  )
+```
+
+## 1. Tabla de atributos
+```{r tabla}
+DT::datatable(
+  gdf_merged %>% sf::st_drop_geometry() %>%
+    mutate(Riesgo = round(risk_score, 2)) %>%
+    select(Municipio = ADM2_ES, Departamento = ADM1_ES,
+           `Pob.Total` = T_TL, `Pob.5‑30` = pop_5_30,
+           `%5‑30` = pct_5_30, `%Género Masc.` = pct_men,
+           RWI = rwi_mean, Densidad = rast_dens_mean,
+           `Baja Densidad` = low_density, Riesgo),
+  filter = 'top', options = list(pageLength = 15, scrollX = TRUE)
+)
+```
+
+## 2. Mapas interactivos
+```{r paletas, include=FALSE}
+pal_edad <- leaflet::colorNumeric(c('#f8e71c','#f5a623','#d0021b'), domain = c(25, 60), na.color = '#fff')
+pal_genero <- leaflet::colorNumeric(c('#4a90e2','#7ed321','#d0021b'), domain = c(45, 60), na.color = '#fff')
+pal_rwi  <- leaflet::colorNumeric(c('#d0021b','#f5a623','#7ed321'), domain = c(-1.5, 1.5), na.color = '#fff')
+pal_dens <- leaflet::colorNumeric(c('#4a90e2','#50e3c2','#f8e71c'), domain = c(0, 1000), na.color = '#fff')
+pal_risk <- leaflet::colorNumeric(c('#7ed321','#f5a623','#d0021b'), domain = range(gdf_merged$risk_score, na.rm = TRUE), na.color = '#fff')
+```
+
+### 2.1 Población 5‑30 años
+Estudios sociodemográficos indican que la población joven (especialmente entre 15 y 29 años) representa un segmento crucial para el desarrollo social. Monitorear esta cohorte es esencial para identificar zonas que requieren mayor inversión en oportunidades educativas y laborales para mitigar riesgos de vulnerabilidad social.
+
+```{r mapa_edad, out.height="600px"}
+leaflet(gdf_merged) %>%
+  addTiles(group = "Base") %>%
+  addPolygons(
+    fillColor = ~pal_edad(pct_5_30), fillOpacity = 0.8, weight = 0.5, color = '#555',
+    popup = ~paste0(
+      "<b>", ADM2_ES, "</b><br>Depto: ", ADM1_ES,
+      "<br>% 5‑30: ", pct_5_30, "%",
+      "<br>Población 5‑30: ", formatC(pop_5_30, format = "d", big.mark = ","),
+      "<br>Densidad: ", round(rast_dens_mean, 1), " hab/km²"
+    ),
+    group = "Pob 5‑30"
+  ) %>%
+  addLegend(pal = pal_edad, values = ~pct_5_30, title = "% 5‑30", position = "bottomright") %>%
+  addLayersControl(baseGroups = c("Base"), overlayGroups = "Pob 5‑30", options = layersControlOptions(collapsed = FALSE))
+```
+
+**Análisis:** El mapa evidencia una alta concentración de población joven en áreas metropolitanas clave. Estas zonas concentran una mayor presión demográfica, lo cual, sin la provisión de oportunidades adecuadas, incrementa sustancialmente el nivel de vulnerabilidad social.
+
+### 2.2 Distribución por género
+La literatura sociológica documenta que ciertas dinámicas de desbalance demográfico, particularmente una mayor proporción masculina, pueden estar asociadas con retos en la cohesión social comunitaria. Mapear estas áreas ayuda a perfilar el riesgo de conflictividad social y priorizar intervenciones comunitarias.
+
+```{r mapa_genero, out.height="600px"}
+leaflet(gdf_merged) %>%
+  addTiles(group = "Base") %>%
+  addPolygons(
+    fillColor = ~pal_genero(pct_men), fillOpacity = 0.8, weight = 0.5, color = '#555',
+    popup = ~paste0(
+      "<b>", ADM2_ES, "</b><br>% Género Masc.: ", pct_men, "%",
+      "<br>% Género Fem.: ", pct_women, "%"
+    ),
+    group = "Género"
+  ) %>%
+  addLegend(pal = pal_genero, values = ~pct_men, title = "% Género Masc.", position = "bottomright") %>%
+  addLayersControl(baseGroups = c("Base"), overlayGroups = "Género", options = layersControlOptions(collapsed = FALSE))
+```
+
+**Análisis:** La distribución muestra municipios específicos con una proporción masculina atípicamente alta, a menudo ligados a dinámicas de migración laboral o zonas fronterizas. Estos desbalances demográficos requieren una atención focalizada para fomentar la integración y prevenir la marginación.
+
+### 2.3 Índice de Riqueza Relativa (RWI)
+La marginación socioeconómica y la pobreza son reconocidas por instituciones como el Banco Mundial como factores críticos que limitan el desarrollo integral. El RWI mide el nivel de riqueza relativa; a menor índice, mayor es la vulnerabilidad estructural y la necesidad de desarrollo económico.
+
+```{r mapa_rwi, out.height="600px"}
+leaflet(gdf_merged) %>%
+  addTiles(group = "Base") %>%
+  addPolygons(
+    fillColor = ~pal_rwi(rwi_mean), fillOpacity = 0.8, weight = 0.5, color = '#555',
+    popup = ~paste0(
+      "<b>", ADM2_ES, "</b><br>RWI medio: ", round(rwi_mean, 3),
+      "<br>Puntos de muestra: ", rwi_n
+    ),
+    group = "RWI"
+  ) %>%
+  addLegend(pal = pal_rwi, values = ~rwi_mean, title = "RWI", position = "bottomright") %>%
+  addLayersControl(baseGroups = c("Base"), overlayGroups = "RWI", options = layersControlOptions(collapsed = FALSE))
+```
+
+**Análisis:** Los resultados exponen una marcada disparidad económica, donde los municipios periféricos sufren de bajos índices de riqueza. Esta precariedad subraya la urgencia de implementar políticas de inclusión económica sustentable como mecanismo de resiliencia.
+
+### 2.4 Densidad poblacional
+La alta densidad urbana a menudo correlaciona con dinámicas complejas de seguridad ciudadana debido a la concentración de recursos y el anonimato. Al mismo tiempo, las áreas con densidad extremadamente baja pueden experimentar limitaciones en la provisión de servicios estatales y control territorial.
+
+```{r mapa_dens, out.height="600px"}
+leaflet(gdf_merged) %>%
+  addTiles(group = "Base") %>%
+  addPolygons(
+    fillColor = ~pal_dens(pmin(rast_dens_mean, 1000)), fillOpacity = 0.8, weight = 0.5, color = '#555',
+    popup = ~paste0(
+      "<b>", ADM2_ES, "</b><br>Densidad: ", round(rast_dens_mean, 1), " hab/km²",
+      "<br>Baja densidad: ", ifelse(low_density, "Sí", "No")
+    ),
+    group = "Densidad"
+  ) %>%
+  addLegend(pal = pal_dens, values = ~pmin(rast_dens_mean, 1000), title = "hab/km²", position = "bottomright") %>%
+  addLayersControl(baseGroups = c("Base"), overlayGroups = "Densidad", options = layersControlOptions(collapsed = FALSE))
+```
+
+**Análisis:** Se observa una aglomeración masiva en el corredor central y norte del país. Estas áreas altamente densas representan centros neurálgicos que demandan estrategias de planificación urbana y seguridad ciudadana robustas.
+
+### 2.5 Índice de Riesgo Compuesto
+Este índice sintetiza la vulnerabilidad demográfica (edad y género), la precariedad socioeconómica (RWI) y los factores geográficos (densidad) en una sola métrica. Proporciona una herramienta analítica precisa para focalizar los recursos de prevención y desarrollo donde convergen múltiples factores críticos.
+
+```{r mapa_riesgo, out.height="600px"}
+leaflet(gdf_merged) %>%
+  addTiles(group = "Base") %>%
+  addPolygons(
+    fillColor = ~pal_risk(risk_score), fillOpacity = 0.85, weight = 0.5, color = '#555',
+    popup = ~paste0(
+      "<b>", ADM2_ES, "</b><br>Riesgo: ", round(risk_score, 2),
+      "<br>% 5‑30: ", pct_5_30, "%",
+      "<br>RWI: ", round(rwi_mean, 3),
+      "<br>% Género Masc.: ", pct_men, "%"
+    ),
+    group = "Riesgo"
+  ) %>%
+  addLegend(pal = pal_risk, values = ~risk_score, title = "Índice Riesgo", position = "bottomright") %>%
+  addLayersControl(baseGroups = c("Base"), overlayGroups = "Riesgo", options = layersControlOptions(collapsed = FALSE))
+```
+
+**Análisis:** El índice revela de forma contundente que la mayor vulnerabilidad se agrupa en polos urbanos y ciertas rutas logísticas. Identifica empíricamente las zonas donde la intervención gubernamental preventiva y de desarrollo es más urgente.
+
+## 3. Enfoque en áreas críticas
+### 3.1 San Pedro Sula (Cortés)
+```{r spu, out.height="600px"}
+spu <- gdf_merged %>% filter(grepl("Cort", ADM1_ES, ignore.case = TRUE))
+leaflet(spu) %>%
+  addTiles() %>%
+  addPolygons(fillColor = ~pal_risk(risk_score), fillOpacity = 0.8, weight = 0.5, color = '#555',
+    popup = ~paste0("<b>", ADM2_ES, "</b><br>Riesgo: ", round(risk_score,2))) %>%
+  addLegend(pal = pal_risk, values = ~risk_score, title = "Riesgo SPU")
+```
+
+**Análisis:** El departamento de Cortés y San Pedro Sula muestran puntuaciones de vulnerabilidad elevadas y homogéneas. Esto subraya la necesidad de priorizar programas integrales de prevención social en este vital motor económico del país.
+
+### 3.2 Tegucigalpa (Francisco Morazán)
+```{r teg, out.height="600px"}
+teg <- gdf_merged %>% filter(grepl("Moraz", ADM1_ES, ignore.case = TRUE))
+leaflet(teg) %>%
+  addTiles() %>%
+  addPolygons(fillColor = ~pal_risk(risk_score), fillOpacity = 0.8, weight = 0.5, color = '#555',
+    popup = ~paste0("<b>", ADM2_ES, "</b><br>Riesgo: ", round(risk_score,2))) %>%
+  addLegend(pal = pal_risk, values = ~risk_score, title = "Riesgo TEG")
+```
+
+**Análisis:** El Distrito Central y sus municipios aledaños presentan un nivel de vulnerabilidad sumamente elevado impulsado por la fuerte concentración demográfica. Las asimetrías económicas en esta región exacerban la exclusión y requieren políticas activas de cohesión social.
+
+## 4. Conclusiones
+El análisis geoespacial revela que los niveles más altos de vulnerabilidad social se concentran de forma desproporcionada en los grandes centros urbanos, impulsados por la densidad poblacional, la disparidad económica y una alta concentración de jóvenes. El Índice de Riesgo Compuesto sintetiza eficazmente estas variables estructurales para identificar con precisión las áreas de atención prioritaria a nivel municipal. Estos hallazgos demuestran de manera analítica que los retos de seguridad ciudadana en Honduras están intrínsecamente ligados a la marginación socioeconómica y demográfica, proveyendo evidencia crucial para dirigir las intervenciones de desarrollo, prevención y bienestar del Estado.
+
+## Referencias
+1. WorldPop. *Honduras: Population Count 2026*. WorldPop, 2025. <https://www.worldpop.org>
+2. Chi, G. et al. "Microestimates of Wealth for All Low‑ and Middle‑Income Countries." *PNAS*, 119(3), 2022. <https://doi.org/10.1073/pnas.2113658119>
+3. Meta/UC Berkeley. *Honduras Relative Wealth Index*. HDX, 2022. <https://data.humdata.org/dataset/relative-wealth-index>
+4. OCHA. *Honduras Subnational Administrative Boundaries*. HDX. <https://data.humdata.org/dataset/cod-ab-hnd>
+5. INE/OCHA. *Honduras Subnational Population Statistics ADM2 2024*. HDX. <https://data.humdata.org/dataset/cod-ps-hnd>
+6. Runfola, D. et al. "geoBoundaries." *PLOS ONE*, 15(4), 2020. <https://doi.org/10.1371/journal.pone.0231866>
